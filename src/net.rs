@@ -54,6 +54,7 @@ pub struct Net {
     /// Hard wall-clock deadline for optional work (probes, bundles, sitemaps).
     deadline: Option<Instant>,
     cache: Option<(String,bool,bool)>,
+    offline: bool,
 }
 
 impl Net {
@@ -77,6 +78,7 @@ impl Net {
             timeout: Duration::from_secs(timeout_secs),
             deadline: None,
             cache: None,
+            offline: false,
         })
     }
 
@@ -88,17 +90,21 @@ impl Net {
             timeout: self.timeout,
             deadline: self.deadline,
             cache: self.cache.clone(),
+            offline: self.offline,
         }
     }
 
-    pub fn configure_cache(&mut self, dir: String, enabled: bool, offline: bool) { self.cache = if enabled || offline { Some((dir, enabled, offline)) } else { None }; }
+    pub fn configure_cache(&mut self, dir: String, enabled: bool, offline: bool) {
+        self.cache = if enabled || offline { Some((dir, enabled, offline)) } else { None };
+        self.offline = offline;
+    }
 
     /// Everything except the homepage is "optional": past this instant we stop starting new requests.
     pub fn set_deadline(&mut self, after: Duration) {
         self.deadline = Some(Instant::now() + after);
     }
 
-    fn remaining(&self) -> Option<Duration> {
+    pub fn remaining(&self) -> Option<Duration> {
         self.deadline.map(|d| d.saturating_duration_since(Instant::now()))
     }
 
@@ -117,19 +123,26 @@ impl Net {
             let path = std::path::Path::new(dir).join(format!("{key}.json"));
             if path.exists() { if let Ok(data)=std::fs::read(&path) { if let Ok(c)=serde_json::from_slice::<Cached>(&data) { return Ok(c.into_resp(url)); } } }
             if *offline { return Err(format!("нет ответа в офлайн-кэше: {url}")); }
-            let result=self.fetch_live(url,max,timeout)?;
+            let result=self.fetch_live(url,max,timeout,true)?;
             if *write { let _=std::fs::create_dir_all(dir); let c=Cached::from_resp(&result); if let Ok(data)=serde_json::to_vec(&c) { let _=std::fs::write(path,data); } }
             return Ok(result);
         }
-        self.fetch_live(url,max,timeout)
+        if self.offline {
+            return Err("сетевой запрос запрещён в --offline".to_string());
+        }
+        self.fetch_live(url,max,timeout,true)
     }
 
-    fn fetch_live(&self, url: &str, max: usize, timeout: Duration) -> Result<Resp,String> {
-        let timeout = match self.remaining() {
-            Some(left) if left.is_zero() => return Err("пропущено: бюджет времени исчерпан".to_string()),
-            Some(left) => timeout.min(left),
-            None => timeout,
-        };
+    /// Active security probes must neither persist possibly sensitive response bodies
+    /// nor follow a redirect to a different origin. A 3xx response is returned as-is.
+    pub fn get_probe(&self, url: &str, max: usize, timeout: Duration) -> Result<Resp, String> {
+        if self.offline {
+            return Err("активная проверка недоступна в --offline".to_string());
+        }
+        self.fetch_live(url, max, timeout.min(self.timeout), false)
+    }
+
+    fn fetch_live(&self, url: &str, max: usize, timeout: Duration, follow_redirects: bool) -> Result<Resp,String> {
         let mut current = url.to_string();
         let mut chain: Vec<String> = Vec::new();
         let mut total_ms: u64 = 0;
@@ -138,6 +151,13 @@ impl Net {
             if !visited.insert(current.clone()) {
                 break;
             }
+            // Redirects are separate requests: each hop must fit in the *remaining*
+            // budget rather than reusing the timeout calculated for the first hop.
+            let timeout = match self.remaining() {
+                Some(left) if left.is_zero() => return Err("пропущено: бюджет времени исчерпан".to_string()),
+                Some(left) => timeout.min(left),
+                None => timeout,
+            };
             let started = Instant::now();
             let resp = self
                 .client
@@ -159,7 +179,7 @@ impl Net {
             }
             .to_string();
 
-            if (300..400).contains(&status) {
+            if follow_redirects && (300..400).contains(&status) {
                 if let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok()) {
                     let next = Url::parse(&current)
                         .ok()
@@ -353,5 +373,52 @@ pub fn origin_of(url: &str) -> String {
     match Url::parse(url) {
         Ok(u) => format!("{}://{}{}", u.scheme(), u.host_str().unwrap_or(""), if let Some(p) = u.port() { format!(":{p}") } else { String::new() }),
         Err(_) => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+    use std::thread;
+
+    #[test]
+    fn redirects_cannot_restart_the_remaining_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let count = Arc::new(AtomicUsize::new(0));
+        let flag = stop.clone();
+        let requests = count.clone();
+        let server = thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut buf = [0; 2048];
+                        if stream.read(&mut buf).is_err() { continue; }
+                        let hop = requests.fetch_add(1, Ordering::Relaxed) + 1;
+                        thread::sleep(Duration::from_millis(120));
+                        let reply = format!("HTTP/1.1 302 Found\r\nLocation: /hop-{hop}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        let _ = stream.write_all(reply.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                    Err(_) => break,
+                }
+            }
+        });
+        let mut net = Net::new(2, false).unwrap();
+        net.set_deadline(Duration::from_millis(350));
+        let started = Instant::now();
+        let result = net.get(&format!("http://{addr}/"));
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(count.load(Ordering::Relaxed) <= 4, "redirects kept restarting the budget");
+        assert!(elapsed < Duration::from_millis(1200), "redirects took {elapsed:?}");
     }
 }

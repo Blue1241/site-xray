@@ -7,9 +7,12 @@ mod ru;
 mod scan_api;
 mod scan_feeds;
 mod scan_html;
+mod scan_hidden;
 mod scan_js;
+mod scan_php;
 mod scan_robots;
 mod scan_sitemap;
+mod scan_subdomains;
 mod score;
 
 use model::*;
@@ -37,9 +40,13 @@ const HELP: &str = r#"site-xray — рентген сайта одной ком�
   --all             показать все найденные эндпоинты
   --max-js N        сколько JS-бандлов качать (по умолчанию 4)
   --no-js           не качать JS-бандлы
-  --no-verify       не проверять эндпоинты живыми запросами
+  --no-verify       не проверять API/JS-кандидатов, новые пути, параметры и DNS-словарь
+  --subdomains      crt.sh, RapidDNS и небольшой DNS-словарь для корневого домена
+  --hidden          проверить типовые скрытые пути (только с разрешения владельца)
+  --php             разобрать формы и проверить GET-параметры на признаки SQL-ошибок
+  --deep            включить все три дополнительные проверки
   --timeout SEC     таймаут запроса (по умолчанию 10)
-  --budget SEC      сколько всего секунд тратить на дополнительные проверки (по умолчанию 8)
+  --budget SEC      лимит секунд на фазу дополнительных проверок (по умолчанию 8)
   --cache-dir PATH  каталог кэша (по умолчанию ~/.cache/site-xray)
   --no-cache         не читать и не записывать кэш
   --offline          собрать отчёт только из кэшированных ответов
@@ -53,6 +60,7 @@ const HELP: &str = r#"site-xray — рентген сайта одной ком�
   site-xray habr.com
   site-xray https://example.com --json | jq .verdict
   site-xray shop.example --md report.md
+  site-xray example.com --deep --budget 20  # только при наличии разрешения
 "#;
 
 struct Opts {
@@ -64,6 +72,9 @@ struct Opts {
     max_js: usize,
     js: bool,
     verify: bool,
+    subdomains: bool,
+    hidden: bool,
+    php: bool,
     timeout: u64,
     budget: u64,
     insecure: bool,
@@ -90,6 +101,9 @@ fn main() {
         max_js: 4,
         js: true,
         verify: true,
+        subdomains: false,
+        hidden: false,
+        php: false,
         timeout: 10,
         budget: 8,
         insecure: false,
@@ -114,6 +128,10 @@ fn main() {
             "--all" => opts.all = true,
             "--no-js" => opts.js = false,
             "--no-verify" => opts.verify = false,
+            "--subdomains" => opts.subdomains = true,
+            "--hidden" => opts.hidden = true,
+            "--php" => opts.php = true,
+            "--deep" => { opts.subdomains = true; opts.hidden = true; opts.php = true; }
             "--insecure" => opts.insecure = true,
             "--budget" => {
                 i += 1;
@@ -198,6 +216,10 @@ fn run(opts: Opts) -> i32 {
     };
 
     let cache_dir = opts.cache_dir.clone().or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.cache/site-xray")));
+    if opts.offline && cache_dir.is_none() {
+        eprintln!("site-xray: для --offline укажи --cache-dir или HOME");
+        return 1;
+    }
     if let Some(d) = cache_dir { net.configure_cache(d, !opts.no_cache, opts.offline); }
     // ---- 1. homepage (with https → http fallback) ----
     let candidates = url_candidates(&opts.target);
@@ -267,7 +289,8 @@ fn run(opts: Opts) -> i32 {
         let api_h = {
             let net = &net;
             let origin = origin.clone();
-            s.spawn(move || scan_api::probe(net, &origin))
+            let verify = opts.verify;
+            s.spawn(move || if verify { scan_api::probe(net, &origin) } else { Vec::new() })
         };
         let js_h = {
             let net = &js_net;
@@ -317,6 +340,59 @@ fn run(opts: Opts) -> i32 {
     let t_feeds = started.elapsed().as_millis();
     let security = detect::security(&home, &html, extras);
     let tech = detect::tech(&home, &html, &security.cookies);
+
+    // Explicitly requested security checks get their own shared budget, after the
+    // ordinary data-discovery phases. Active requests never follow redirects or
+    // cache response bodies; a cross-host homepage redirect is not consent to
+    // probe that other host.
+    let active_disabled = if opts.offline {
+        Some("--offline")
+    } else if !opts.verify {
+        Some("--no-verify")
+    } else if !same_scan_scope(&home.requested, &final_url) {
+        Some("главная перенаправлена на другой хост или порт либо на небезопасный HTTP")
+    } else {
+        None
+    };
+    let (subdomains, hidden, php) = if opts.subdomains || opts.hidden || opts.php {
+        net.set_deadline(std::time::Duration::from_secs(opts.budget));
+        std::thread::scope(|s| {
+            let subdomains_h = opts.subdomains.then(|| {
+                let net = &net;
+                let host = host_of(&home.requested);
+                let verify = opts.verify;
+                let offline = opts.offline;
+                s.spawn(move || scan_subdomains::SubdomainScanner::new(&host).scan(net, verify, offline))
+            });
+            let hidden_h = opts.hidden.then(|| {
+                let net = &net;
+                let origin = &origin;
+                s.spawn(move || scan_hidden::HiddenScanner::new(origin).scan(net, active_disabled))
+            });
+            let php_h = opts.php.then(|| {
+                let net = &net;
+                let final_url = &final_url;
+                let html = &html;
+                s.spawn(move || scan_php::PhpScanner::new(final_url).scan(net, html, active_disabled))
+            });
+            (
+                subdomains_h.map(|h| h.join().unwrap_or_else(|_| SubdomainReport {
+                    warnings: vec!["Модуль поддоменов аварийно завершился; результаты неполные.".into()],
+                    ..SubdomainReport::default()
+                })),
+                hidden_h.map(|h| h.join().unwrap_or_else(|_| HiddenReport {
+                    warnings: vec!["Модуль скрытых путей аварийно завершился; результаты неполные.".into()],
+                    ..HiddenReport::default()
+                })),
+                php_h.map(|h| h.join().unwrap_or_else(|_| PhpReport {
+                    warnings: vec!["Модуль параметров аварийно завершился; результаты неполные.".into()],
+                    ..PhpReport::default()
+                })),
+            )
+        })
+    } else {
+        (None, None, None)
+    };
 
     let http = HttpInfo {
         requested: home.requested.clone(),
@@ -370,6 +446,9 @@ fn run(opts: Opts) -> i32 {
         js: js_report,
         security,
         tech,
+        subdomains,
+        hidden,
+        php,
         channels: vec![],
         verdict: Verdict::default(),
     };
@@ -387,7 +466,7 @@ fn run(opts: Opts) -> i32 {
 
     // ---- 6. output ----
     let style = Style { color: opts.color && !opts.json };
-    let terminal = report::render(&rep, &style, if opts.all { 40 } else { 10 });
+    let terminal = report::render(&rep, &style, if opts.all { usize::MAX } else { 10 });
 
     if let Some(path) = &opts.md {
         let path = if path.is_empty() {
@@ -427,6 +506,17 @@ fn run(opts: Opts) -> i32 {
         let _ = path;
     }
     0
+}
+
+fn same_scan_scope(requested: &str, final_url: &str) -> bool {
+    let (Ok(a), Ok(b)) = (Url::parse(requested), Url::parse(final_url)) else { return false };
+    // An HTTP → HTTPS upgrade on the same host is fine; never actively probe an
+    // HTTP downgrade of an HTTPS target or a different host/port.
+    !(a.scheme() == "https" && b.scheme() != "https") && a.host() == b.host() && match (a.port(), b.port()) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn url_candidates(input: &str) -> Vec<String> {
@@ -498,5 +588,19 @@ fn atty_stdout() -> bool {
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_scan_scope;
+
+    #[test]
+    fn active_scope_allows_only_a_safe_same_host_redirect() {
+        assert!(same_scan_scope("http://example.com/", "https://example.com/new"));
+        assert!(same_scan_scope("http://example.com:8080/", "http://example.com:8080/new"));
+        assert!(!same_scan_scope("https://example.com/", "http://example.com/"));
+        assert!(!same_scan_scope("https://example.com/", "https://other.example.com/"));
+        assert!(!same_scan_scope("http://example.com:8080/", "http://example.com:8081/"));
     }
 }
