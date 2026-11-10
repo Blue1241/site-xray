@@ -4,6 +4,18 @@ use crate::net::absolutize;
 use regex::Regex;
 use scraper::{Html, Selector};
 use std::collections::BTreeSet;
+use url::Url;
+
+/// Treat only recognized methods as such; invalid page text must not be printed
+/// verbatim or interpreted as an authorization to send a GET probe.
+pub fn form_method(raw: Option<&str>) -> &'static str {
+    match raw.unwrap_or("get").trim().to_ascii_lowercase().as_str() {
+        "" | "get" => "GET",
+        "post" => "POST",
+        "dialog" => "DIALOG",
+        _ => "OTHER",
+    }
+}
 
 pub struct HtmlScan {
     pub title: Option<String>,
@@ -128,9 +140,15 @@ pub fn scan(html: &str, page_url: &str) -> HtmlScan {
     if let Some(s) = sel("form[action]") {
         for el in doc.select(&s) {
             let Some(action) = el.value().attr("action") else { continue };
-            let method = el.value().attr("method").unwrap_or("get").to_uppercase();
-            if let Some(abs) = absolutize(page_url, action) {
-                let entry = format!("{method} {abs}");
+            let method = form_method(el.value().attr("method"));
+            if let Some(mut url) = absolutize(page_url, action).and_then(|abs| Url::parse(&abs).ok()) {
+                // Actions may contain CSRF tokens or other sensitive query values.
+                // These notes are for display only, never for making requests.
+                url.set_query(None);
+                url.set_fragment(None);
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                let entry = format!("{method} {url}");
                 if !html_forms.contains(&entry) {
                     html_forms.push(entry);
                 }

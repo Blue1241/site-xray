@@ -361,6 +361,62 @@ pub fn render(report: &Report, style: &Style, max_endpoints: usize) -> String {
         line(format!("  {}", style.dim(&trunc(n, 100))));
     }
 
+    // ---- optional security-oriented scans ----
+    if let Some(sub) = &report.subdomains {
+        line(String::new());
+        line(style.bold(&format!("◆ ПОДДОМЕНЫ  {}", sub.domain.as_deref().unwrap_or("домен не определён"))));
+        for source in &sub.sources {
+            let message = source.message.as_deref().map(|m| format!(" · {m}")).unwrap_or_default();
+            line(format!("  {}: {} · {} записей{}", source.name, source.status, source.records, message));
+        }
+        line(style.dim(&format!("  DNS-словарь: проверено {}/{}", sub.dictionary_checked, sub.dictionary_total)));
+        for finding in sub.subdomains.iter().take(max_endpoints) {
+            line(format!("  {} {}  {}", style.dim("·"), style.cyan(&finding.name), style.dim(&finding.sources.join(", "))));
+        }
+        if sub.subdomains.len() > max_endpoints {
+            line(style.dim(&format!("  … ещё {} (запусти с --all)", sub.subdomains.len() - max_endpoints)));
+        }
+        if !sub.subdomains.is_empty() {
+            line(style.dim("  Имена из публичных источников не обязательно существуют; * — wildcard сертификата."));
+        }
+        for warning in &sub.warnings { line(format!("  {} {}", style.yellow("!"), warning)); }
+    }
+    if let Some(hidden) = &report.hidden {
+        line(String::new());
+        line(style.bold(&format!("◆ СКРЫТЫЕ ПУТИ  ответов {}/{}", hidden.checked, hidden.total)));
+        for finding in hidden.findings.iter().take(max_endpoints) {
+            let redirect = finding.location.as_deref().map(|l| format!(" → {l}")).unwrap_or_default();
+            line(format!("  {} HTTP {}{}", style.cyan(&finding.path), finding.status, redirect));
+        }
+        if hidden.findings.len() > max_endpoints {
+            line(style.dim(&format!("  … ещё {} (запусти с --all)", hidden.findings.len() - max_endpoints)));
+        }
+        if hidden.checked > 0 {
+            line(style.dim("  Это кандидаты, а не подтверждённые утечки; содержимое не сохраняется."));
+        }
+        for warning in &hidden.warnings { line(format!("  {} {}", style.yellow("!"), warning)); }
+    }
+    if let Some(php) = &report.php {
+        line(String::new());
+        line(style.bold(&format!("◆ ФОРМЫ И ПАРАМЕТРЫ  форм: {} · параметров: {}", php.forms.len(), php.parameters.len())));
+        for form in php.forms.iter().take(max_endpoints) {
+            line(format!("  форма {} {}{}", form.method, style.cyan(&form.action), if form.same_origin { "" } else { " (внешняя)" }));
+        }
+        for p in php.parameters.iter().take(max_endpoints) {
+            let state = if p.tested { "проверен".to_string() } else { format!("не проверен: {}", p.skip_reason.as_deref().unwrap_or("нет ответа")) };
+            let idor = if p.idor_candidate { " · ID-параметр" } else { "" };
+            line(format!("  {} {} ?{}  {}{}", p.method, style.cyan(&p.endpoint), p.name, style.dim(&state), idor));
+        }
+        if php.parameters.len() > max_endpoints {
+            line(style.dim(&format!("  … ещё {} (запусти с --all)", php.parameters.len() - max_endpoints)));
+        }
+        for finding in &php.sql_errors {
+            line(format!("  {} возможная SQL-ошибка: {} ?{} · HTTP {} · {}", style.yellow("!"), finding.endpoint, finding.parameter, finding.status, finding.signature));
+        }
+        line(style.dim("  SQL-ошибки не доказывают SQLi; IDOR требует проверки прав с разными пользователями."));
+        for warning in &php.warnings { line(format!("  {} {}", style.yellow("!"), warning)); }
+    }
+
     // ---- extras ----
     let extras: Vec<&Probe> = report.security.extras.iter().filter(|p| p.status == 200).collect();
     if !extras.is_empty() {
@@ -535,6 +591,70 @@ pub fn render_markdown(report: &Report) -> String {
     if !report.js.inline_states.is_empty() {
         o.push_str(&format!("\nInline-JSON на странице: {}\n", report.js.inline_states.join(", ")));
     }
+    if let Some(sub) = &report.subdomains {
+        o.push_str(&format!("\n## Поддомены: {}\n\n", sub.domain.as_deref().unwrap_or("домен не определён")));
+        for source in &sub.sources {
+            let message = source.message.as_deref().map(|m| format!(" — {m}")).unwrap_or_default();
+            o.push_str(&format!("- {}: {}, {} записей{}\n", source.name, source.status, source.records, message));
+        }
+        o.push_str(&format!("- DNS-словарь: проверено {}/{}\n", sub.dictionary_checked, sub.dictionary_total));
+        for finding in &sub.subdomains {
+            o.push_str(&format!("- {} — {}\n", md_code(&finding.name), finding.sources.join(", ")));
+        }
+        if !sub.subdomains.is_empty() {
+            o.push_str("\nИмена из публичных источников могут не существовать; `*.` обозначает wildcard сертификата.\n");
+        }
+        for warning in &sub.warnings { o.push_str(&format!("- ⚠️ {warning}\n")); }
+    }
+    if let Some(hidden) = &report.hidden {
+        o.push_str(&format!("\n## Скрытые пути\n\nПолучено ответов: {}/{}.\n\n", hidden.checked, hidden.total));
+        for finding in &hidden.findings {
+            let location = finding.location.as_deref().map(|l| format!(" → {}", md_code(l))).unwrap_or_default();
+            o.push_str(&format!("- {} — HTTP {}{}\n", md_code(&finding.path), finding.status, location));
+        }
+        if hidden.checked > 0 { o.push_str("\nЭто кандидаты, а не подтверждённые утечки; содержимое не сохраняется.\n"); }
+        for warning in &hidden.warnings { o.push_str(&format!("- ⚠️ {warning}\n")); }
+    }
+    if let Some(php) = &report.php {
+        o.push_str("\n## Формы и параметры\n\n");
+        for form in &php.forms {
+            o.push_str(&format!("- Форма {} {}{}\n", form.method, md_code(&form.action), if form.same_origin { "" } else { " (внешняя)" }));
+        }
+        for p in &php.parameters {
+            let state = if p.tested { "проверен".to_string() } else { format!("не проверен: {}", p.skip_reason.as_deref().unwrap_or("нет ответа")) };
+            let idor = if p.idor_candidate { "; ID-параметр" } else { "" };
+            o.push_str(&format!("- {} {} параметр {} — {}{}\n", p.method, md_code(&p.endpoint), md_code(&p.name), state, idor));
+        }
+        for finding in &php.sql_errors {
+            o.push_str(&format!("- ⚠️ Возможная SQL-ошибка: {} параметр {}, HTTP {}, сигнатура {}\n", md_code(&finding.endpoint), md_code(&finding.parameter), finding.status, md_code(&finding.signature)));
+        }
+        o.push_str("\nSQL-ошибка не доказывает SQLi; IDOR требует проверки прав с разными пользователями.\n");
+        for warning in &php.warnings { o.push_str(&format!("- ⚠️ {warning}\n")); }
+    }
     o.push_str("\n---\n\n_Сгенерировано site-xray. Уважай robots.txt, ToS и лимиты сайта._\n");
     o
+}
+
+/// Backslashes do not escape backticks inside Markdown code spans. Use a fence
+/// longer than any backtick run in the (untrusted) value instead.
+fn md_code(s: &str) -> String {
+    let text = s.replace(['\r', '\n'], " ");
+    let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run + 1);
+    let padding = if text.starts_with('`') || text.ends_with('`')
+        || (text.starts_with(' ') && text.ends_with(' ')) { " " } else { "" };
+    format!("{fence}{padding}{text}{padding}{fence}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::md_code;
+
+    #[test]
+    fn markdown_code_spans_contain_untrusted_backticks() {
+        assert_eq!(md_code("id"), "`id`");
+        assert_eq!(md_code("a`b"), "``a`b``");
+        assert_eq!(md_code("`a`"), "`` `a` ``");
+        assert_eq!(md_code("a\nb"), "`a b`");
+    }
 }

@@ -113,6 +113,84 @@ pub struct JsReport {
     pub notes: Vec<String>,
 }
 
+/// A name found in a public source or confirmed by a dictionary DNS lookup.
+/// A `*.` prefix denotes a certificate wildcard, not a confirmed DNS host.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SubdomainFinding {
+    pub name: String,
+    pub sources: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SubdomainSource {
+    pub name: String,
+    pub status: String,
+    pub records: usize,
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SubdomainReport {
+    pub domain: Option<String>,
+    pub subdomains: Vec<SubdomainFinding>,
+    pub sources: Vec<SubdomainSource>,
+    pub dictionary_checked: usize,
+    pub dictionary_total: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct HiddenFinding {
+    pub path: String,
+    pub status: u16,
+    /// Redirects are not followed during active checks.
+    pub location: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct HiddenReport {
+    pub attempted: usize,
+    pub checked: usize,
+    pub total: usize,
+    pub findings: Vec<HiddenFinding>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PhpForm {
+    pub action: String,
+    pub method: String,
+    pub same_origin: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PhpParameter {
+    /// The endpoint is reported without query values or credentials.
+    pub endpoint: String,
+    pub name: String,
+    pub method: String,
+    pub source: String,
+    pub idor_candidate: bool,
+    pub tested: bool,
+    pub skip_reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PhpFinding {
+    pub endpoint: String,
+    pub parameter: String,
+    pub status: u16,
+    pub signature: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PhpReport {
+    pub forms: Vec<PhpForm>,
+    pub parameters: Vec<PhpParameter>,
+    pub sql_errors: Vec<PhpFinding>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct HeaderCheck {
     pub name: String,
@@ -186,6 +264,13 @@ pub struct Report {
     pub js: JsReport,
     pub security: SecurityReport,
     pub tech: Vec<TechHit>,
+    /// Optional scans are omitted from JSON unless explicitly requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdomains: Option<SubdomainReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<HiddenReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub php: Option<PhpReport>,
     pub channels: Vec<Channel>,
     pub verdict: Verdict,
 }
