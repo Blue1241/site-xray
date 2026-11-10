@@ -1,0 +1,78 @@
+site-xray v0.1.0  2026-11-09 21:20 UTC
+──────────────────────────────────────────────────────────────────────────────
+habr.com  →  https://habr.com/ru/feed/ HTTP 200
+  653 мс · 307 КБ · HTTP/2 · 1 редирект(ов) · https · TLS ✔
+  “Публикации / Моя лента / Хабр”
+
+◆ ВЕРДИКТ — откуда брать данные без браузера
+  Лучший канал — sitemap.xml (https://habr.com/sitemap_articles1.xml): 27207 URL с lastmod, чистый XML и один GET вместо браузера.
+  · sitemap.xml — 89/100: 27207 URL в 7 документах
+  · RSS / Atom — 75/100: Все публикации подряд на Хабре — 40 записей, найден пробой
+  · JSON API — 41/100: 4 кандидата, ни один не ответил JSON
+  · в sitemap есть lastmod → можно инкрементально обновлять выгрузку
+
+  План
+  1. Выгрузи список URL: curl -s https://habr.com/sitemap_articles1.xml | sed -n 's:.*<loc>\(.*\)</loc>.*:\1:p' > urls.txt
+  2. Пройди urls.txt с конкурентностью 4–8 и паузами, кэшируй ответы по URL
+  3. С каждого документа снимай JSON-LD (если есть) и OG-мету — это дешевее полноценного парсинга
+  4. Инкремент держи по lastmod, если он есть, иначе по хешу контента
+
+  Осторожно
+  ! перед сайтом Qrator: лимиты и баны прилетают быстро
+  ! robots.txt прячет: /search/, /ru/search/, /en/search/, /ru/users/*/followers/
+  ! сайт просит crawl-delay 10
+
+◆ КАНАЛЫ ДАННЫХ
+ ★ 1. sitemap.xml              █████████░  89/100  27207 URL в 7 документах
+        https://habr.com/sitemap_articles1.xml — 27207 URL, lastmod: да
+        индексов sitemap: 1 → документов: 7
+ • 2. RSS / Atom               ████████░░  75/100  Все публикации подряд на Хабре — 40 записей, найден пробой
+        https://habr.com/rss [rss] 40 записей, свежее: Mon, 09 Nov 2026 21:18:49 GMT
+ • 3. JSON API                 ████░░░░░░  41/100  4 кандидата, ни один не ответил JSON
+        https://habr.com/kek/v1/auth/habrahabr/?back=${t}&hl=${e}  [api] ×1
+        /kek/v1/auth/habrahabr/?back=${this.$route.path}&hl=${this.langOptions.hl}  [api] ×1
+        https://habr.com/kek/v1/auth/habrahabr/?back=${this.$route.path}&hl=${this.langOptions.hl}  [ap…
+ • 4. Парсинг HTML (fallback)  ██░░░░░░░░  22/100  страница 307 КБ, text/html
+        серверный HTML — данные придётся выковыривать селекторами
+ × 5. Служебные файлы          ──────────       —  нет
+ × 6. JSON-LD (schema.org)     ──────────       —  микроразметки нет
+
+◆ СТЕК И ЗАЩИТА
+  server: QRATOR  ·  CDN/WAF: Qrator
+  Технологии: Google Analytics (gtag) (Аналитика), Яндекс.Метрика (Аналитика), reCAPTCHA (Антибот)
+  Заголовки: HSTS ✔  CSP ✖  X-Frame-Options ✔  X-Content-Type-Options ✔  Referrer-Policy ✖  Permissions-Policy ✖   оценка C (60/100)
+  антибот: признаков не найдено
+
+◆ ROBOTS.TXT  200
+  50 правил Disallow, 0 Allow, 4 пользовательских групп; crawl-delay: 10 — держи паузы между запросами
+  прячет: /search/, /ru/search/, /en/search/, /ru/users/*/followers/, /en/users/*/followers/, /ru/users/*/following/, /en/users/*/following/
+
+◆ SITEMAP  найден  27207 URL · 7 документов · lastmod ✔
+  · https://habr.com/sitemap.xml sitemapindex 24 HTTP 200
+  · https://habr.com/sitemap_articles1.xml urlset (child) 5390 HTTP 200
+  · https://habr.com/sitemap_articles2.xml urlset (child) 5385 HTTP 200
+  · https://habr.com/sitemap_articles3.xml urlset (child) 5377 HTTP 200
+  · https://habr.com/sitemap_articles4.xml urlset (child) 5358 HTTP 200
+  · https://habr.com/sitemap_companies.xml urlset (child) 5258 HTTP 200
+  4 документа прочитаны не целиком (лимит на размер) — реальное число URL больше
+  примеры: https://habr.com/ru/hubs/hi/  https://habr.com/ru/hubs/perl/  https://habr.com/ru/hubs/AJAX/  https://habr.com/ru/hubs/microformats/  https://habr.com/ru/hubs/hosting/  https://habr.com/ru/hubs/cms/ …
+
+◆ ФИДЫ  1
+  · https://habr.com/rss [rss] 40 записей Mon, 09 Nov 2026 21:18:49 GMT
+      Все публикации подряд на Хабре
+
+◆ JSON-LD  нет валидных блоков
+
+◆ JSON API / ЭНДПОИНТЫ  4 кандидата  бандлов: 4, 1.4 МБ
+   28 https://habr.com/kek/v1/auth/habrahabr/?back=${t}&hl=${… api       не проверен
+      ×1 · строка в бандле
+   28 /kek/v1/auth/habrahabr/?back=${this.$route.path}&hl=${t… api       не проверен
+      ×1 · строка в бандле
+   28 https://habr.com/kek/v1/auth/habrahabr/?back=${this.$ro… api       не проверен
+      ×1 · строка в бандле
+   28 /kek/v1/auth/habrahabr-register/?back=${this.$route.pat… api       не проверен
+      ×1 · строка в бандле
+  OpenGraph: 8 тегов
+
+готово за 5905 мс · site-xray · открытые данные, без браузера
+
